@@ -1,3 +1,4 @@
+
 import socket, sys
 import threading
 import time
@@ -5,17 +6,15 @@ import heapq
 
 BUFSIZE = 1024
 TIME_TO_LIVE = 15
-LSA_KA_PERIOD = 2
 KEEP_ALIVE_HEADER = "keepalive"
 LSA_HEADER = "LSA"
 seq_num = 0
 lock = threading.Lock() # for graph
 uuid_map_lock = threading.Lock()
-peers_lock = threading.Lock()
-lsa_lock = threading.Lock()
 keep_rx = True
 keep_tx = True
 lsa_to_forward = []
+
 
 class Network_node():
   def __init__(self, uuid, name, port, peers, graph, uuid_to_name):
@@ -26,7 +25,7 @@ class Network_node():
     self.graph = graph # current graph of whole network
     self.uuid_to_name = uuid_to_name # dictionary to fill in for official map
     self.host = None
-    self.lsa_nums = dict() # dictionary of uuid: (lsa num, lsa msg)
+    self.lsa_nums = dict()
     
 class Network_peer():
   def __init__(self, host, port, metric):
@@ -36,7 +35,6 @@ class Network_peer():
     self.last_keep_alive = time.time() # initialized in constructor
     self.name = None
 
-# https://builtin.com/software-engineering-perspectives/dijkstras-algorithm
 class D_Node:
   def __init__(self):
       self.d=float('inf') #current distance from source node
@@ -44,6 +42,7 @@ class D_Node:
       self.finished=False
 
 def dijkstra(graph,source):
+  # print('d graph', graph)
   nodes={}
   for node in graph:
       nodes[node]=D_Node()
@@ -138,8 +137,7 @@ def kill_nodes(node, dead_nodes):
   for peer_uuid in node.peers:
     if (peer_uuid not in dead_nodes):
       new_peers[peer_uuid] = node.peers[peer_uuid]
-  with peers_lock:
-    node.peers = new_peers
+  node.peers = new_peers
    
 def reachability(node):
   res_dict = dict()
@@ -182,19 +180,17 @@ def add_neighbor_cmd(node, cmd):
   # tx thread will automatically start sending keep alive messages 
   # "automatic detection" from other neighbor accomplished by LSAs 
   uuid, host, port, metric =  parse_new_neighbor(cmd)
-  with peers_lock:
-    node.peers[uuid] = Network_peer(host, port, metric)
+  node.peers[uuid] = Network_peer(host, port, metric)
   return
 
 def add_neighbor_ka(node, name, uuid, host, port, metric):
-  with peers_lock:
-    node.peers[uuid] = Network_peer(host, port, metric)
-    node.peers[uuid].name = name
+  node.peers[uuid] = Network_peer(host, port, metric)
+  node.peers[uuid].name = name
   with uuid_map_lock:
     node.uuid_to_name[uuid] = name
 
 def make_lsa(node):
-  lsa = LSA_HEADER + "."+ node.name + "." + node.uuid + "."
+  lsa = LSA_HEADER + "."+ node.name + "."
   for peer_uuid in node.peers:
     peer = node.peers[peer_uuid]
     peer_name = get_name(node, peer_uuid)
@@ -216,12 +212,8 @@ def is_lsa(msg):
 def parse_lsa(msg):
   msg = msg.split(".")
   sender_name = msg[1]
-  uuid = msg[2]
-  with uuid_map_lock:
-    if (uuid not in node.uuid_to_name):
-      node.uuid_to_name[uuid] = sender_name
   cur_seq_num = int(msg[-1])
-  edges = msg[3].split(",")
+  edges = msg[2].split(",")
   lsa_graph = {sender_name: dict()}
   for edge in edges:
     edge = edge.split(":")
@@ -236,72 +228,78 @@ def get_name(node, neighbor_uuid):
   else:
     return None
 
+def update_uuid_to_name(node, key, metric):
+  # looking for node.graph[node.name][uuid -> key] = metric
+  if not (is_uuid(key)):
+    own_neighbors = node.graph[node.name]
+    for neighbor in own_neighbors:
+      if (own_neighbors[neighbor] == metric and is_uuid(neighbor)):
+        with uuid_map_lock:
+          node.uuid_to_name[neighbor] = key
+ 
+def sub_own_name_key(node, named_graph):
+  final_graph = dict()
+  for key in named_graph:
+    connections = named_graph[key]
+    final_graph[key] = dict()
+    for conn in connections:
+      conn_name = get_name(node, conn) 
+      named_conn = conn
+      if (conn_name != None):
+        named_conn = conn_name
+      metric = named_graph[key][conn]
+      final_graph[key][named_conn] = metric
+      if (named_conn == node.name):
+        update_uuid_to_name(node, key, metric)
+  return final_graph
+
+def sub_own_name(node, lsa_graph):
+  named_graph = dict()
+  for neighbor in lsa_graph:
+    neighbor_name = get_name(node, neighbor)
+    named_key = neighbor
+    if (neighbor_name != None):
+      named_key = neighbor_name
+    named_graph[named_key] = lsa_graph[neighbor]
+  final_graph = sub_own_name_key(node, named_graph)
+  return final_graph
+
 def construct_peer_graph(node):
   peer_graph = dict()
-  with uuid_map_lock:
-    for peer_uuid in node.peers:
-      if (peer_uuid not in node.uuid_to_name):
-        peer_name = peer_uuid
-      else:
-        peer_name = node.uuid_to_name[peer_uuid]
-      peer = node.peers[peer_uuid]
-      peer_graph[peer_name] = peer.metric
-    return peer_graph
+  for peer_uuid in node.peers:
+    peer = node.peers[peer_uuid]
+    peer_key = peer_uuid
+    if (peer.name != None):
+      peer_key = peer.name
+    peer_graph[peer_key] = peer.metric
+  return peer_graph
     
 def update_own_graph(node):
   peer_graph = construct_peer_graph(node)
   with lock:
     node.graph[node.name] = peer_graph
-
-def uuid_to_name(node, graph):
-  named_graph = dict()
-  with uuid_map_lock and lock: # locking graph as well
-    for v in graph:
-      key = None
-      if (is_uuid(v) and v in node.uuid_to_name):
-        name =  node.uuid_to_name[v]
-        key = name
-      else:
-        key = v
-      named_graph[key] = dict()
-      for conn in graph[v]:
-        c_key = None
-        if (is_uuid(conn) and conn in node.uuid_to_name):
-          c_name = node.uuid_to_name[conn]
-          c_key = c_name
-        else:
-          c_key = conn
-        named_graph[key][c_key] = graph[v][conn]
-  return named_graph
-   
+          
 def update_graph(node, sender_name, lsa_graph, cur_seq_num, msg, socket):
   # if seq number higher than last lsa -> update
   # otherwise, disregard
   if (sender_name not in node.lsa_nums):
-    with lsa_lock:
-      node.lsa_nums[sender_name] = (cur_seq_num, msg)
+    node.lsa_nums[sender_name] = (cur_seq_num, msg)
   else:
     last_lsa = node.lsa_nums[sender_name][0]
     if not (cur_seq_num > last_lsa):
-      return # discard
+      return
     else:
-      with lsa_lock:
-        node.lsa_nums[sender_name] = (cur_seq_num, msg)
+      node.lsa_nums[sender_name] = (cur_seq_num, msg)
   
   # substitute own name in received lsa for uuid
-  named_graph = uuid_to_name(node, lsa_graph)
-  update_own_graph(node) # updating peers in own graph
+  named_graph = sub_own_name(node, lsa_graph)
+  update_own_graph(node)
   # substitute known names in own graph
-  named_cur_graph = uuid_to_name(node, node.graph)
+  named_cur_graph = sub_own_name(node, node.graph)
   
   for key in named_graph:
-    for conn in named_graph[key]:
-      metric = named_graph[key][conn]
-      if (key not in named_cur_graph):
-        named_cur_graph[key] = {conn: metric}
-      if (conn not in named_cur_graph[key]):
-        named_cur_graph[key][conn] = metric
-        
+    if (key not in named_cur_graph):
+      named_cur_graph[key] = named_graph[key]
   with lock:
     node.graph = named_cur_graph
        
@@ -324,12 +322,12 @@ def make_graph_bidirectional(cur_graph):
 def rank(node):
   cur_graph = node.graph
   d_graph = make_graph_bidirectional(cur_graph)
-  shortest_paths = dijkstra(d_graph, node.name)
-  rank_dict = dict()
-  for named_node in shortest_paths:
-    if (named_node != node.name):
-      rank_dict[named_node] = shortest_paths[named_node].d
-  return {"rank": rank_dict}
+  # shortest_paths = dijkstra(d_graph, node.name)
+  # rank_dict = dict()
+  # for named_node in shortest_paths:
+  #   if (named_node != node.name):
+  #     rank_dict[named_node] = shortest_paths[named_node].d
+  return {"rank": dict()}
 
 def rx_thread(name, socket, node):
   while (keep_rx):
@@ -340,9 +338,8 @@ def rx_thread(name, socket, node):
     if (is_keep_alive(msg)):
       name, uuid, host, port, metric = parse_keep_alive(msg)
       if (uuid in node.peers):
-        with peers_lock:
-          node.peers[uuid].last_keep_alive = time.time()
-          node.peers[uuid].name = name
+        node.peers[uuid].last_keep_alive = time.time()
+        node.peers[uuid].name = name
       else:
         # seeing new uuid
         add_neighbor_ka(node, name, uuid, host, port, metric)
@@ -385,7 +382,7 @@ def tx_thread(name, socket, node):
         socket.sendto(lsa.encode(), (addr, port))
       except Exception as e:
         pass 
-    time.sleep(LSA_KA_PERIOD)
+    time.sleep(1)
   
 if __name__ == '__main__':
   conf_file = None
